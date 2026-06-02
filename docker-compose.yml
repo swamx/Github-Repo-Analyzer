@@ -1,0 +1,145 @@
+﻿services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: github-analyzer-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: litellm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm_password
+      POSTGRES_DB: litellm_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Pulling llama3 for LiteLLM fallback...' &&
+      ollama pull ${OLLAMA_MODEL:-llama3} &&
+      echo 'Ollama model ready'
+      "
+    restart: "no"
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml
+      - litellm_data:/tmp
+    command:
+      - "--config"
+      - "/app/config.yaml"
+    environment:
+      - DATABASE_URL=postgresql://litellm:litellm_password@postgres:5432/litellm_db
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OLLAMA_API_BASE=http://ollama:11434
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  api:
+    build: .
+    container_name: github-analyzer-api
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      # LLM â€” routed through LiteLLM proxy
+      PRIMARY_MODEL: ${PRIMARY_MODEL:-claude-haiku}
+      SECONDARY_MODEL: ${SECONDARY_MODEL:-ollama-llama3}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      LITELLM_API_BASE: ${LITELLM_API_BASE:-http://litellm:4000}
+      # Must equal LITELLM_MASTER_KEY so the proxy accepts requests
+      LITELLM_API_KEY: ${LITELLM_MASTER_KEY}
+      # Circuit breaker
+      LITELLM_FAILURE_THRESHOLD: ${LITELLM_FAILURE_THRESHOLD:-3}
+      LITELLM_FAILURE_RECOVERY_SECONDS: ${LITELLM_FAILURE_RECOVERY_SECONDS:-60}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CACHE_TTL_SECONDS: 600
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3001:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_ADMIN_EMAIL: admin@local.host
+      WEBUI_ADMIN_PASSWORD: admin12345
+      ENABLE_SIGNUP: "False"
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  ollama_data:
+  open_webui_data:
+  litellm_data:
+  postgres_data:
+
