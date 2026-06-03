@@ -1,7 +1,8 @@
 # GitHub Engineering Intelligence API
 
 AI-powered GitHub repository analytics with LLM-powered insights, conversational analysis,
-and a built-in LLM-as-a-Judge prompt evaluation service.
+a built-in LLM-as-a-Judge prompt evaluation service, and **IssuePilot** — an autonomous
+multi-agent pipeline that researches GitHub issues and opens fix branches/PRs.
 
 ---
 
@@ -25,6 +26,7 @@ summaries and recommendations through a **LiteLLM proxy** that routes to Claude 
 | **Resiliency** | Circuit breaker + retry + rate limiting on all LLM calls |
 | **Caching** | Redis-backed analysis cache (10-min TTL) with in-memory fallback |
 | **Observability** | Structured logging, OpenTelemetry traces/metrics, LiteLLM request tracking |
+| **IssuePilot** | Autonomous multi-agent pipeline: Google ADK coordinator + parallel Claude Code workers fix GitHub issues and open PRs |
 
 ---
 
@@ -32,6 +34,22 @@ summaries and recommendations through a **LiteLLM proxy** that routes to Claude 
 
 ```text
 github-analyzer/
+├── issue_pilot/                         # IssuePilot multi-agent pipeline
+│   ├── config.py                        # Settings: GOOGLE_API_KEY, ANTHROPIC_API_KEY, LEAN_CTX_CMD, …
+│   ├── schemas.py                       # FixRequest, JobEnqueued, JobResult, IssuePlan
+│   ├── routes.py                        # POST /api/issue-pilot/fix, GET /api/issue-pilot/status/{id}
+│   ├── coordinator/
+│   │   ├── agent.py                     # Google ADK LlmAgent (Gemini) — orchestrates all workers
+│   │   └── tools.py                     # @tool functions: load_job, fetch_all_issues, dispatch_all_workers, …
+│   ├── workers/
+│   │   ├── claude_agent.py              # Async subprocess launcher for `claude` CLI per issue
+│   │   ├── skills.py                    # Tech-stack detection → ctx_knowledge recall instruction
+│   │   └── mcp_config.py               # Writes per-worker lean-ctx 3.0 MCP config JSON
+│   ├── agents/
+│   │   └── github_tools.py             # GitHub API functions: fetch_issue, create_branch, create_pull_request
+│   └── pipeline/
+│       ├── queue.py                     # Redis Streams producer (async) + consumer helpers (sync)
+│       └── worker.py                    # Standalone blocking process: reads stream → runs coordinator
 ├── app/
 │   ├── config.py                    # All settings from env vars
 │   ├── api/
@@ -196,6 +214,136 @@ Live health check — circuit breaker state + LiteLLM ping.
   }
 }
 ```
+
+---
+
+## IssuePilot — Autonomous Issue Fixer
+
+IssuePilot is a multi-agent pipeline that takes a list of GitHub issue numbers and a
+repository URL, then autonomously researches each issue and opens a fix branch (and
+optionally a PR) — all in parallel.
+
+### Architecture
+
+```text
+POST /api/issue-pilot/fix
+         │ job enqueued → Redis Stream
+         ▼
+pipeline/worker.py
+         │ run_coordinator(job_id)
+         ▼
+Google ADK LlmAgent  (Gemini 2.0 Flash — fast orchestration)
+   coordinator/agent.py
+   │
+   ├─ load_job()              reads job from Redis
+   ├─ fetch_all_issues()      GitHub API batch
+   ├─ prepare_branches()      one branch per issue on remote
+   ├─ dispatch_all_workers()  ──► asyncio.gather ──────────────────┐
+   ├─ create_pull_requests()                                        │
+   └─ mark_job_done()                    parallel Claude Code workers
+                                                    │
+                                        workers/claude_agent.py
+                                        subprocess: `claude` CLI
+                                          ├─ lean-ctx 3.0 MCP attached
+                                          ├─ ctx_overview  (repo map)
+                                          ├─ ctx_knowledge (skill load)
+                                          ├─ ctx_search    (find code)
+                                          ├─ ctx_read      (read files)
+                                          ├─ Edit / Write  (code fix)
+                                          └─ git commit + return JSON
+```
+
+Each Claude Code worker operates autonomously inside a cloned copy of the repo.
+lean-ctx 3.0 compresses file reads by up to 99%, keeping each worker's token
+consumption minimal even on large codebases.
+
+### POST `/api/issue-pilot/fix`
+
+Submit a repo URL and list of issue numbers. Returns a job ID immediately (HTTP 202).
+The fix pipeline runs asynchronously — poll `/status/{job_id}` for progress.
+
+```bash
+curl -X POST http://localhost:8000/api/issue-pilot/fix \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_url": "https://github.com/your-org/your-repo",
+    "issue_numbers": [42, 57, 91],
+    "create_pr": true,
+    "base_branch": "main"
+  }'
+```
+
+Response:
+
+```json
+{
+  "job_id": "a3f8c2d1...",
+  "status": "queued",
+  "status_url": "/api/issue-pilot/status/a3f8c2d1..."
+}
+```
+
+### GET `/api/issue-pilot/status/{job_id}`
+
+Poll until `status` is `done` or `failed`.
+
+```bash
+curl http://localhost:8000/api/issue-pilot/status/a3f8c2d1...
+```
+
+Response (`done`):
+
+```json
+{
+  "job_id": "a3f8c2d1...",
+  "status": "done",
+  "repo_url": "https://github.com/your-org/your-repo",
+  "issue_plans": [
+    {
+      "issue_number": 42,
+      "title": "NullPointerException in auth middleware",
+      "plan": "## Fix Plan for Issue #42 ..."
+    }
+  ],
+  "branch_name": "issue-pilot/a3f8c2d1/issue-42",
+  "pr_url": "https://github.com/your-org/your-repo/pull/123",
+  "created_at": "2026-06-03T10:00:00Z",
+  "updated_at": "2026-06-03T10:08:42Z"
+}
+```
+
+### Running the pipeline worker
+
+The pipeline worker must run alongside the FastAPI server:
+
+```bash
+# Terminal 1 — API server
+uvicorn main:app --reload
+
+# Terminal 2 — IssuePilot worker (reads Redis stream, runs ADK coordinator)
+python -m issue_pilot.pipeline.worker
+```
+
+### IssuePilot environment variables
+
+```env
+# Google ADK coordinator (Gemini)
+GOOGLE_API_KEY=AIza...
+COORDINATOR_MODEL=gemini-2.0-flash       # optional override
+
+# Claude Code workers
+ANTHROPIC_API_KEY=sk-ant-...
+LEAN_CTX_CMD=npx -y lean-ctx             # lean-ctx 3.0 launch command
+
+# GitHub
+GITHUB_TOKEN=ghp_...                     # needs repo + read:user scopes
+
+# Tuning
+WORKER_TIMEOUT_S=600                     # max seconds per Claude Code subprocess
+MAX_PARALLEL_WORKERS=5                   # concurrent claude processes
+```
+
+---
 
 ### POST `/api/judge/compare`
 

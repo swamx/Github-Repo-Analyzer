@@ -170,6 +170,89 @@ uvicorn main:app --reload
 
 ---
 
+---
+
+## IssuePilot — autonomous issue fixer
+
+IssuePilot needs three extra keys and a second process alongside the API server.
+
+### 1. Add IssuePilot env vars
+
+```env
+# .env (append to existing)
+GOOGLE_API_KEY=AIza...          # coordinator (Gemini 2.0 Flash)
+ANTHROPIC_API_KEY=sk-ant-...    # Claude Code workers
+LEAN_CTX_CMD=npx -y lean-ctx   # lean-ctx 3.0 — adjust if installed differently
+GITHUB_TOKEN=ghp_...            # needs repo + write scopes for PR creation
+```
+
+### 2. Start the pipeline worker
+
+In a second terminal (the API server must already be running):
+
+```bash
+python -m issue_pilot.pipeline.worker
+```
+
+You should see:
+
+```text
+INFO issue_pilot.pipeline.worker IssuePilot pipeline worker started
+```
+
+### 3. Submit issues to fix
+
+```bash
+curl -X POST http://localhost:8000/api/issue-pilot/fix \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_url": "https://github.com/your-org/your-repo",
+    "issue_numbers": [42, 57],
+    "create_pr": true,
+    "base_branch": "main"
+  }'
+```
+
+Response (HTTP 202):
+
+```json
+{
+  "job_id": "a3f8c2d1e9b04f...",
+  "status": "queued",
+  "status_url": "/api/issue-pilot/status/a3f8c2d1e9b04f..."
+}
+```
+
+### 4. Poll for results
+
+```bash
+# repeat until status is "done" or "failed"
+curl http://localhost:8000/api/issue-pilot/status/a3f8c2d1e9b04f...
+```
+
+When done:
+
+```json
+{
+  "status": "done",
+  "issue_plans": [
+    { "issue_number": 42, "title": "...", "plan": "## Fix Plan..." },
+    { "issue_number": 57, "title": "...", "plan": "## Fix Plan..." }
+  ],
+  "pr_url": "https://github.com/your-org/your-repo/pull/123"
+}
+```
+
+### What happens under the hood
+
+1. Job enqueued → Redis Stream
+2. Pipeline worker reads job → starts Google ADK coordinator (Gemini)
+3. Coordinator fans out one `claude` CLI subprocess per issue (parallel)
+4. Each Claude Code worker: runs lean-ctx 3.0, detects tech stack, loads skills, researches issue, writes fix, commits
+5. Coordinator collects results → creates PRs → marks job done
+
+---
+
 ## Running tests
 
 ```bash

@@ -14,6 +14,11 @@ pydantic-settings==2.7.1
 langgraph==0.2.21
 langchain==0.2.17
 
+# IssuePilot — coordinator (Google ADK / Gemini) + workers (Claude Code CLI)
+google-adk==1.2.1
+google-generativeai==0.8.4
+anthropic==0.55.0          # available to claude subprocess via ANTHROPIC_API_KEY
+
 # Additional dependencies
 python-dateutil==2.9.0.post0
 pytz==2024.2

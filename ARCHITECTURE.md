@@ -284,3 +284,137 @@ redis (healthcheck: redis-cli ping)
 The `api` container will not start until both `redis` and `litellm` report healthy.
 This prevents the `ConnectError` that occurs when the API tries to call LiteLLM before
 it finishes initializing.
+
+---
+
+## IssuePilot — Multi-Agent Architecture
+
+IssuePilot is a separate async pipeline that runs alongside the FastAPI server.
+It introduces two new AI layers on top of the existing infrastructure:
+
+### Component diagram
+
+```text
+Client
+  │  POST /api/issue-pilot/fix  {repo_url, issue_numbers, create_pr}
+  ▼
+FastAPI  (issue_pilot/routes.py)
+  │  HTTP 202 + job_id  ◄──────────────────────────────────────────┐
+  │                                                                  │
+  │  enqueue job_id → Redis Stream "issue_pilot:jobs"               │
+  ▼                                                                  │
+pipeline/worker.py  (blocking process, 1 per deployment)            │ poll
+  │  XREADGROUP (consumer group "workers")                          │ /status/{job_id}
+  ▼                                                                  │
+coordinator/agent.py  ─── Google ADK LlmAgent  (Gemini 2.0 Flash)  │
+  │                                                                  │
+  │  ADK tool call sequence (strict order):                         │
+  │  1. load_job()           ─ reads JobPayload from Redis Hash     │
+  │  2. fetch_all_issues()   ─ GitHub REST API batch                │
+  │  3. prepare_branches()   ─ creates N branches on remote         │
+  │  4. dispatch_all_workers() ─ asyncio.gather (non-blocking fan-out)
+  │  5. create_pull_requests() ─ GitHub API (if create_pr=True)     │
+  │  6. mark_job_done()      ─ writes final state → Redis Hash ─────┘
+  │
+  │  dispatch_all_workers calls asyncio.gather over N coroutines:
+  │
+  ├── workers/claude_agent.py  (issue #42)
+  ├── workers/claude_agent.py  (issue #57)   ← all run concurrently
+  └── workers/claude_agent.py  (issue #91)
+
+Each claude_agent.py coroutine:
+  1. git clone --depth 1 <repo> into a temp dir
+  2. Detect tech stack  → workers/skills.py
+  3. Write lean-ctx 3.0 MCP config JSON  → workers/mcp_config.py
+  4. Spawn subprocess:
+       claude \
+         --mcp-config /tmp/issue_pilot_mcp_<N>.json \
+         --allowedTools "mcp__lean-ctx__ctx_*,Edit,Write,Bash" \
+         --output-format json \
+         -p "<issue prompt>"
+  5. Wait (timeout=WORKER_TIMEOUT_S)
+  6. Parse JSON result from stdout
+  7. rm -rf tempdir, unlink mcp config
+  8. Return WorkerResult → coordinator collects into IssuePlan list
+```
+
+### Inside each Claude Code worker
+
+The `claude` subprocess receives a structured prompt that instructs it to use
+lean-ctx 3.0 for all context operations:
+
+```text
+Prompt phases (in order):
+
+Phase 1 — Context loading (lean-ctx 3.0, minimal tokens)
+  ctx_overview()               → compressed project map (~200 tokens)
+  ctx_knowledge(recall=skills) → load Python/FastAPI/TypeScript/… best practices
+  ctx_search(pattern)          → find relevant code (compact ripgrep output)
+  ctx_read(file, mode=map)     → file signatures only unless editing
+
+Phase 2 — Root-cause analysis
+  ctx_read(file, mode=full)    → only files that need editing
+  Bash(git log --oneline -10)  → recent commit context
+
+Phase 3 — Code fix
+  Edit / Write                 → make minimal correct changes
+  Bash(pytest -x -q)           → verify tests pass
+
+Phase 4 — Commit + output
+  Bash(git add -A && git commit -m "fix: #N …")
+  Return JSON: {issue_number, title, plan, files_changed, tests_passed, commit_sha}
+```
+
+lean-ctx 3.0 compresses file reads by 60–99% vs raw cat/Read, allowing workers to
+understand large codebases while spending far fewer tokens.
+
+### Redis data model
+
+```text
+Redis Stream  "issue_pilot:jobs"
+  Message fields: { job_id: "<uuid>" }
+  Consumer group: "workers"
+
+Redis Hash  "issue_pilot:job:<job_id>"   (TTL: JOB_TTL_SECONDS = 24h)
+  Fields (JSON-serialised JobPayload):
+    job_id, repo_url, issue_numbers, create_pr, base_branch
+    status: queued | processing | done | failed
+    issue_plans: [{issue_number, title, plan}, …]
+    branch_name, pr_url, error
+    created_at, updated_at
+```
+
+### Agent responsibilities
+
+| Agent | Model | Role |
+| --- | --- | --- |
+| Coordinator | Gemini 2.0 Flash | Orchestration: load job, dispatch workers, collect results, create PRs |
+| Worker (one per issue) | Claude Code (`claude` CLI) | Autonomous coding: research, implement fix, commit |
+
+The coordinator uses a **fast, cheap** model (Gemini Flash) because its job is pure
+orchestration — tool call sequencing, not reasoning. The heavy thinking happens inside
+each Claude Code worker which has the full `claude-opus-4-8` brain.
+
+### Error handling
+
+| Scenario | Behaviour |
+| --- | --- |
+| Worker subprocess timeout | `asyncio.wait_for` kills the process; error stored in result |
+| Worker exits non-zero | Stderr captured; job continues (other workers unaffected) |
+| Branch already exists | Worker clones default branch and creates branch locally |
+| PR creation fails | Logged; `branch_name` still set so branch is accessible |
+| Coordinator tool call fails | ADK agent logs and proceeds to `mark_job_done` |
+| Redis unavailable at enqueue | FastAPI returns 500; job never queued |
+
+### Token efficiency via lean-ctx 3.0
+
+Workers are instructed to follow CEP (Context Engineering Protocol) rules:
+
+- `ctx_read(mode=map)` — signatures only; saves ~80% vs full file read
+- `ctx_read(mode=signatures)` — function/class names only; ~95% savings
+- `ctx_search` — compact ripgrep; saves ~60% vs raw `grep`
+- `ctx_overview` — one-shot project map at session start; replaces repeated `ls`/`cat`
+- `ctx_knowledge recall` — loads pre-compressed skill context; avoids re-reading docs
+
+This means a worker can fully understand a 50-file Python service in ~2 000 tokens
+instead of the ~40 000 tokens a naive approach would use.
