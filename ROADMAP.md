@@ -1,6 +1,6 @@
 # Development Roadmap
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 ---
 
@@ -69,7 +69,33 @@ Last updated: 2026-06-02
 
 ---
 
-## Phase 2: Core Enhancements (Next Priority)
+## Phase 2: IssuePilot — Autonomous Issue Fixer (In Progress 🔄)
+
+### Architecture
+
+- [x] `issue_pilot/` module — self-contained pipeline package
+- [x] `POST /api/issue-pilot/fix` — async job submission (HTTP 202 + job_id)
+- [x] `GET /api/issue-pilot/status/{job_id}` — polling endpoint
+- [x] Redis Streams queue — `issue_pilot:jobs` stream + consumer group
+- [x] Google ADK coordinator agent (Gemini 2.0 Flash) — orchestrates full job lifecycle
+- [x] Parallel Claude Code workers — one `claude` CLI subprocess per issue
+- [x] lean-ctx 3.0 MCP integration — 60–99% token reduction in workers
+- [x] Tech-stack skill detection — auto-loads Python/TS/Go/… best practices via ctx_knowledge
+- [x] GitHub branch creation per issue
+- [x] Optional PR creation with AI-generated description per issue
+
+### Pending
+
+- [ ] Task status API — expose pipeline stage (queued → planning → coding → PR opened) via Postgres or Redis; list all tasks for a given repo
+- [ ] LiteLLM routing for Claude Code worker calls — route via proxy with `repo_url` + `issue_number` metadata flags; requires downside review first
+- [ ] Webhook: POST to caller-supplied URL when a job reaches `done` or `failed`
+- [ ] Web UI — live status page per job (SSE-driven progress stream)
+- [ ] Worker concurrency cap — honour `MAX_PARALLEL_WORKERS` in asyncio.gather
+- [ ] Retry logic — re-queue failed workers up to N times before marking issue failed
+
+---
+
+## Phase 3: Core Analytics Enhancements
 
 ### A. Advanced Metrics
 
