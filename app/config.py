@@ -30,6 +30,15 @@ class Settings:
     LITELLM_FAILURE_THRESHOLD = int(os.getenv("LITELLM_FAILURE_THRESHOLD", "3"))
     LITELLM_FAILURE_RECOVERY_SECONDS = int(os.getenv("LITELLM_FAILURE_RECOVERY_SECONDS", "60"))
 
+    # GitHub API configuration for code review
+    GITHUB_API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com")
+    GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+
+    # Code review policy thresholds (0.0–1.0)
+    REVIEW_CONFIDENCE_INFO_THRESHOLD = float(os.getenv("REVIEW_CONFIDENCE_INFO_THRESHOLD", "0.65"))
+    REVIEW_CONFIDENCE_BLOCK_THRESHOLD = float(os.getenv("REVIEW_CONFIDENCE_BLOCK_THRESHOLD", "0.85"))
+    REVIEW_DB_PATH = os.getenv("REVIEW_DB_PATH", "code_review_feedback.db")
+
     # API metadata
     API_TITLE = "GitHub Engineering Intelligence API"
     API_VERSION = "2.0.0"
@@ -41,6 +50,12 @@ class Settings:
             raise ValueError("GITHUB_TOKEN environment variable not set")
         if not Settings.LITELLM_API_KEY:
             raise ValueError("LITELLM_API_KEY environment variable not set")
+        if not Settings.GITHUB_WEBHOOK_SECRET:
+            import logging
+            logging.getLogger(__name__).warning(
+                "GITHUB_WEBHOOK_SECRET not set; webhook endpoint will reject unsigned requests. "
+                "Direct /api/code-review/review endpoint will still work."
+            )
 
 
 settings = Settings()

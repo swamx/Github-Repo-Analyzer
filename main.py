@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.api.routes import router
 from app.api.judge_routes import router as judge_router
+from app.api.code_review_routes import router as code_review_router
 from issue_pilot.routes import router as issue_pilot_router
 
 logging.basicConfig(
@@ -109,6 +110,7 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api", tags=["Analytics & Chat"])
 app.include_router(judge_router, prefix="/api/judge", tags=["LLM Judge"])
+app.include_router(code_review_router, prefix="/api/code-review", tags=["Code Review"])
 app.include_router(issue_pilot_router, prefix="/api/issue-pilot", tags=["IssuePilot"])
 
 
@@ -122,6 +124,8 @@ async def root():
             "analyze": "/api/analyze",
             "chat": "/api/chat",
             "health": "/api/health",
+            "code_review": "/api/code-review/review",
+            "code_review_webhook": "/api/code-review/webhook",
             "docs": "/docs",
         },
     }
